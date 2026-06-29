@@ -2,7 +2,7 @@
 # Claude Code statusline — custom 2-line layout (macOS & Linux)
 #
 # Output:
-#   my-project on main · PR #123 merged
+#   my-project on main · PR #123 (merged)
 #   Opus 4.6 (high) · ctx ▰▰▰▱▱▱▱▱▱▱ 29% · session $12.50 · cost ▰▰▰▰▰▱▱▱▱▱ $2.5k/$5.0k
 #
 # How it works:
@@ -10,9 +10,10 @@
 #   2. Parses all fields in a single jq call
 #   3. Line 1: project name + git branch + PR status (gh, cached 60s in background)
 #   4. Line 2: model/effort + context bar + session cost + account spending bar
-#   5. Org spending is fetched via OAuth API at api.anthropic.com/api/oauth/usage.
+#   5. Org spending is fetched via Anthropic usage API (cached 5m, backoff on errors).
 #      Token source: macOS Keychain or ~/.claude/.credentials.json (Linux).
-#      Lock file prevents concurrent fetches. Cached to disk.
+#      Atomic mkdir lock prevents concurrent fetches.
+#   6. Security: per-user tmp paths, token passed via stdin (not in ps), input validation.
 #
 # Prerequisites:
 #   - jq, git, gh CLI, curl
@@ -23,30 +24,48 @@
 #   3. Add to ~/.claude/settings.json:
 #      "statusLine": { "type": "command", "command": "sh ~/.claude/statusline.sh", "padding": 0 }
 #   4. Restart Claude Code.
-#
-# Receives JSON via stdin from Claude Code.
 
-input=$(cat)
+# ── Configuration ───────────────────────────────────────────────────────
+PR_POLL_INTERVAL=60                      # seconds between PR status refreshes
+BRANCH_MAX_LEN=60                        # truncate branch names beyond this
 
-# ── Parse all JSON fields in one jq call ─────────────────────────────────
-eval "$(echo "$input" | jq -r '
-  "proj_dir="      + (.workspace.project_dir // .workspace.current_dir // .cwd // "" | @sh) + " " +
-  "resolved_dir="  + (.workspace.current_dir // .cwd // "" | @sh) + " " +
-  "model="         + (.model.display_name // "" | @sh) + " " +
-  "effort="        + (.effort.level // "" | @sh) + " " +
-  "ctx_raw="       + (.context_window.remaining_percentage // 100 | tostring | @sh) + " " +
-  "session_cost="  + (.cost.total_cost_usd // 0 | tostring | @sh) + " " +
-  "repo_url="      + (if .workspace.repo then "https://" + .workspace.repo.host + "/" + .workspace.repo.owner + "/" + .workspace.repo.name else "" end | @sh)
-')"
+USAGE_POLL_INTERVAL=300                    # seconds between usage API refreshes
+USAGE_RETRY_INTERVAL=30                    # seconds between retries when no data
+USAGE_API_TIMEOUT=10                           # curl max-time for usage API
+USAGE_API_URL="https://api.anthropic.com/api/oauth/usage"
+USAGE_API_BETA="oauth-2025-04-20"              # anthropic-beta header value
 
-# ── Portability helpers ──────────────────────────────────────────────────
+BAR_WIDTH=10                             # character width of progress bars
+ESC=$(printf '\033')
+RESET="${ESC}[0m"
+C_CYAN="${ESC}[38;2;86;182;194m"         # project name
+C_GREEN="${ESC}[38;2;152;195;121m"       # branch, open PR, healthy bar
+C_PURPLE="${ESC}[38;2;198;120;221m"      # model, merged PR
+C_DIM="${ESC}[38;2;92;99;112m"           # separators, labels
+C_RED="${ESC}[38;2;224;108;117m"          # closed PR, critical bar
+C_AMBER="${ESC}[38;2;229;192;123m"       # warning bar
+SEP="${C_DIM} · ${RESET}"
+
+# ── Helpers ──────────────────────────────────────────────────────────────
 stat_mtime() {
-  # Linux: stat -c %Y; macOS/BSD: stat -f %m
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
 }
 
+file_age() {
+  [ -e "$1" ] && echo $(( $(date +%s) - $(stat_mtime "$1") )) || echo 999
+}
+
+is_numeric() {
+  case "$1" in ''|*[!0-9.]*) return 1 ;; esac
+}
+
+fmt_dollars() {
+  awk -v v="$1" 'BEGIN{v=v/100; if(v>=1000) printf "%.1fk",v/1000; else printf "%.0f",v}'
+}
+
+secure_dir() { mkdir -p -m 700 "$1" 2>/dev/null; }
+
 claude_token() {
-  # macOS: Keychain; Linux/fallback: credentials file
   if command -v security >/dev/null 2>&1; then
     security find-generic-password -s "Claude Code-credentials" -a "$USER" -w 2>/dev/null \
       | jq -r '.claudeAiOauth.accessToken // empty'
@@ -56,21 +75,8 @@ claude_token() {
   fi
 }
 
-# ── Colors (One Dark) ───────────────────────────────────────────────────
-ESC=$(printf '\033')
-RESET="${ESC}[0m"
-C_CYAN="${ESC}[38;2;86;182;194m"         # project name
-C_GREEN="${ESC}[38;2;152;195;121m"       # branch, open PR, healthy bar
-C_PURPLE="${ESC}[38;2;198;120;221m"      # model, merged PR
-C_DIM="${ESC}[38;2;92;99;112m"           # separators, labels
-C_RED="${ESC}[38;2;224;108;117m"          # closed PR, critical bar
-C_AMBER="${ESC}[38;2;229;192;123m"       # warning bar
-
-SEP="${C_DIM} · ${RESET}"
-
-# ── Helpers ──────────────────────────────────────────────────────────────
 render_bar() {
-  pct=$1; color=$2; width=${3:-10}
+  pct=$1; color=$2; width=${3:-$BAR_WIDTH}
   filled=$(( (pct * width + 50) / 100 ))
   [ "$filled" -gt "$width" ] && filled="$width"
   [ "$filled" -lt 0 ] && filled=0
@@ -82,7 +88,7 @@ render_bar() {
   printf '%s' "${color}${bar}${C_DIM}${ebar}${RESET}"
 }
 
-bar_color() { # invert=1: high % is bad (usage)
+bar_color() {
   pct=$1; invert=${2:-0}
   if [ "$invert" -eq 1 ]; then
     [ "$pct" -ge 80 ] && printf '%s' "$C_RED" && return
@@ -95,6 +101,18 @@ bar_color() { # invert=1: high % is bad (usage)
   fi
 }
 
+# ── Parse input ──────────────────────────────────────────────────────────
+input=$(cat)
+eval "$(echo "$input" | jq -r '
+  "proj_dir="      + (.workspace.project_dir // .workspace.current_dir // .cwd // "" | @sh) + " " +
+  "resolved_dir="  + (.workspace.current_dir // .cwd // "" | @sh) + " " +
+  "model="         + (.model.display_name // "" | @sh) + " " +
+  "effort="        + (.effort.level // "" | @sh) + " " +
+  "ctx_raw="       + (.context_window.remaining_percentage // 100 | tostring | @sh) + " " +
+  "session_cost="  + (.cost.total_cost_usd // 0 | tostring | @sh) + " " +
+  "repo_url="      + (if .workspace.repo then "https://" + .workspace.repo.host + "/" + .workspace.repo.owner + "/" + .workspace.repo.name else "" end | @sh)
+')"
+
 # ── LINE 1: project on branch · PR #N state ─────────────────────────────
 line1=""
 
@@ -106,7 +124,7 @@ branch=""
 
 if [ -n "$branch" ]; then
   disp_branch="$branch"
-  [ "${#disp_branch}" -gt 60 ] && disp_branch="$(printf '%.59s' "$disp_branch")…"
+  [ "${#disp_branch}" -gt "$BRANCH_MAX_LEN" ] && disp_branch="$(printf "%.$(( BRANCH_MAX_LEN - 1 ))s" "$disp_branch")…"
   [ -n "$line1" ] \
     && line1="${line1} ${C_DIM}on${RESET} ${C_GREEN}${disp_branch}${RESET}" \
     || line1="${C_GREEN}${disp_branch}${RESET}"
@@ -114,13 +132,11 @@ fi
 
 # PR status (background-refreshed, cached 60s)
 if [ -n "$branch" ] && [ -n "$resolved_dir" ] && command -v gh >/dev/null 2>&1; then
-  pr_cache="${TMPDIR:-/tmp}/claude-sl-pr"
-  mkdir -p "$pr_cache" 2>/dev/null
+  pr_cache="${TMPDIR:-/tmp}/claude-sl-pr-$(id -u)"
+  secure_dir "$pr_cache"
   pr_file="${pr_cache}/$(printf '%s' "$branch" | tr '/ ' '__')"
 
-  now=$(date +%s)
-  pr_age=$(stat_mtime "$pr_file")
-  if [ ! -f "$pr_file" ] || [ $(( now - pr_age )) -gt 60 ]; then
+  if [ ! -f "$pr_file" ] || [ "$(file_age "$pr_file")" -gt "$PR_POLL_INTERVAL" ]; then
     ( cd "$resolved_dir" 2>/dev/null \
         && gh pr view --json number,state,isDraft -q '[.number,.state,.isDraft]|@tsv' \
              > "${pr_file}.tmp" 2>/dev/null \
@@ -140,12 +156,13 @@ if [ -n "$branch" ] && [ -n "$resolved_dir" ] && command -v gh >/dev/null 2>&1; 
       && pr_link="${ESC}]8;;${repo_url}/pull/${pr_num}${ESC}\\"
     pr_link_end=""
     [ -n "$pr_link" ] && pr_link_end="${ESC}]8;;${ESC}\\"
+    pr_id="${ESC}[4m${pr_link}#${pr_num}${pr_link_end}${ESC}[24m"
     case "$pr_state" in
       OPEN)  [ "$pr_draft" = "true" ] \
-               && pr_seg="${C_DIM}${pr_link}PR #${pr_num} draft${pr_link_end}${RESET}" \
-               || pr_seg="${C_GREEN}${pr_link}PR #${pr_num}${pr_link_end}${RESET}" ;;
-      MERGED) pr_seg="${C_PURPLE}${pr_link}PR #${pr_num} merged${pr_link_end}${RESET}" ;;
-      CLOSED) pr_seg="${C_RED}${pr_link}PR #${pr_num} closed${pr_link_end}${RESET}" ;;
+               && pr_seg="${C_DIM}PR ${pr_id} (draft)${RESET}" \
+               || pr_seg="${C_GREEN}PR ${pr_id} (open)${RESET}" ;;
+      MERGED) pr_seg="${C_PURPLE}PR ${pr_id} (merged)${RESET}" ;;
+      CLOSED) pr_seg="${C_RED}PR ${pr_id} (closed)${RESET}" ;;
     esac
     [ -n "$pr_seg" ] && line1="${line1}${SEP}${pr_seg}"
   fi
@@ -169,49 +186,82 @@ if [ "$ctx_remaining" -ge 0 ] 2>/dev/null; then
 fi
 
 if [ -n "$session_cost" ]; then
-  sc_fmt=$(awk "BEGIN{v=${session_cost}+0; if(v>=1000) printf \"%.1fk\",v/1000; else printf \"%.2f\",v}")
+  sc_fmt=$(awk -v v="$session_cost" 'BEGIN{v=v+0; if(v>=1000) printf "%.1fk",v/1000; else printf "%.2f",v}')
   append2 "${C_DIM}session${RESET} ${C_AMBER}\$${sc_fmt}${RESET}"
 fi
 
 # Org usage — fetched via OAuth usage API (background, lock-guarded)
-usage_dir="${TMPDIR:-/tmp}/claude-sl-usage"
+usage_dir="${TMPDIR:-/tmp}/claude-sl-usage-$(id -u)"
 usage_cache="${usage_dir}/data"
 usage_lock="${usage_dir}/lock"
-mkdir -p "$usage_dir" 2>/dev/null
+usage_backoff="${usage_dir}/backoff"
+secure_dir "$usage_dir"
 
-# Only spawn if lock is absent or stale (>60s = timed out)
-lock_age=999
-[ -f "$usage_lock" ] && lock_age=$(( $(date +%s) - $(stat_mtime "$usage_lock") ))
+poll_interval="$USAGE_POLL_INTERVAL"
+if [ -f "$usage_backoff" ]; then
+  bo=$(cat "$usage_backoff" 2>/dev/null)
+  is_numeric "$bo" && [ "$bo" -gt "$USAGE_POLL_INTERVAL" ] 2>/dev/null && poll_interval="$bo"
+fi
+if [ ! -f "$usage_cache" ] || [ ! -s "$usage_cache" ]; then
+  poll_interval="$USAGE_RETRY_INTERVAL"
+fi
 
-if [ "$lock_age" -gt 60 ]; then
-  touch "$usage_lock" 2>/dev/null
-  ( token=$(claude_token)
-    [ -z "$token" ] && rm -f "$usage_lock" && exit 0
-    json=$(curl -s --max-time 10 "https://api.anthropic.com/api/oauth/usage" \
-      -H "Authorization: Bearer $token" \
-      -H "anthropic-beta: oauth-2025-04-20" \
-      -H "Content-Type: application/json" 2>/dev/null)
-    # Try extra_usage first, fall back to spend object
-    result=$(printf '%s' "$json" | jq -r '
-      if .extra_usage.used_credits then
-        [.extra_usage.used_credits, .extra_usage.monthly_limit, .extra_usage.utilization] | @tsv
-      elif .spend.used.amount_minor then
-        [.spend.used.amount_minor, .spend.limit.amount_minor, .spend.percent] | @tsv
-      else empty end' 2>/dev/null)
-    if [ -n "$result" ] && printf '%s' "$result" | grep -q '	'; then
-      printf '%s' "$result" > "${usage_cache}.tmp" && mv "${usage_cache}.tmp" "$usage_cache"
-    fi
-    rm -f "$usage_lock"
-  ) >/dev/null 2>&1 &
+if [ "$(file_age "$usage_cache")" -gt "$poll_interval" ] && [ "$(file_age "$usage_lock")" -gt "$poll_interval" ]; then
+  rm -rf "$usage_lock" 2>/dev/null
+  if mkdir "$usage_lock" 2>/dev/null; then
+    ( token=$(claude_token)
+      if [ -z "$token" ]; then
+        printf '' > "$usage_cache"
+        rm -rf "$usage_lock"
+        exit 0
+      fi
+      http_code=$(printf 'header = "Authorization: Bearer %s"\n' "$token" \
+        | curl -s -w '%{http_code}' --max-time "$USAGE_API_TIMEOUT" --config - \
+            -o "${usage_cache}.raw" \
+            "$USAGE_API_URL" \
+            -H "anthropic-beta: $USAGE_API_BETA" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: claude-code-statusline/1.0" 2>/dev/null)
+      if [ "$http_code" = "429" ] || [ "$http_code" = "500" ] || [ "$http_code" = "503" ]; then
+        cur=$(cat "$usage_backoff" 2>/dev/null)
+        is_numeric "$cur" || cur="$USAGE_POLL_INTERVAL"
+        next=$(( cur * 2 ))
+        [ "$next" -gt 3600 ] && next=3600
+        printf '%s' "$next" > "$usage_backoff"
+        touch "$usage_cache"
+        rm -rf "$usage_lock"
+        rm -f "${usage_cache}.raw"
+        exit 0
+      fi
+      rm -f "$usage_backoff"
+      result=$(jq -r '
+        if .extra_usage.used_credits then
+          [.extra_usage.used_credits, .extra_usage.monthly_limit, .extra_usage.utilization] | @tsv
+        elif .spend.used.amount_minor then
+          [.spend.used.amount_minor, .spend.limit.amount_minor, .spend.percent] | @tsv
+        else empty end' "${usage_cache}.raw" 2>/dev/null)
+      if [ -n "$result" ] && printf '%s' "$result" | grep -q '	'; then
+        printf '%s' "$result" > "${usage_cache}.tmp" && mv "${usage_cache}.tmp" "$usage_cache"
+      fi
+      rm -f "${usage_cache}.raw"
+      rm -rf "$usage_lock"
+    ) >/dev/null 2>&1 &
+  fi
 fi
 
 if [ -f "$usage_cache" ] && [ -s "$usage_cache" ]; then
   used_cents=$(cut -f1 < "$usage_cache")
   limit_cents=$(cut -f2 < "$usage_cache")
   util_raw=$(cut -f3 < "$usage_cache")
+  is_numeric "$used_cents" || used_cents=""
+  is_numeric "$limit_cents" || limit_cents=""
+  is_numeric "$util_raw" || util_raw=""
   util_int=$(printf '%.0f' "$util_raw" 2>/dev/null)
+  if [ "$util_int" -eq 0 ] 2>/dev/null; then
+    scaled=$(awk -v v="$util_raw" 'BEGIN{v=v+0; if(v>0 && v<=1) printf "%.0f", v*100; else print 0}')
+    util_int="$scaled"
+  fi
   if [ "$util_int" -gt 0 ] 2>/dev/null; then
-    fmt_dollars() { awk "BEGIN{v=$1/100; if(v>=1000) printf \"%.1fk\",v/1000; else printf \"%.0f\",v}"; }
     used_fmt=$(fmt_dollars "$used_cents")
     limit_fmt=$(fmt_dollars "$limit_cents")
     uc=$(bar_color "$util_int" 1)
